@@ -12,6 +12,9 @@
 (define-constant err-invalid-amount (err u108))
 (define-constant err-carrier-not-assigned (err u109))
 (define-constant err-dispute-active (err u110))
+(define-constant err-milestone-already-released (err u111))
+(define-constant err-invalid-milestone (err u112))
+(define-constant err-milestone-not-reached (err u113))
 
 (define-constant status-created u1)
 (define-constant status-assigned u2)
@@ -63,6 +66,16 @@
 
 (define-map authorized-oracles principal bool)
 
+(define-map shipment-milestones
+  uint
+  {
+    pickup-percentage: uint,
+    delivery-percentage: uint,
+    pickup-released: bool,
+    delivery-released: bool
+  }
+)
+
 (define-read-only (get-shipment (shipment-id uint))
   (map-get? shipments shipment-id)
 )
@@ -92,6 +105,10 @@
 
 (define-read-only (get-dispute-timeout)
   (ok (var-get dispute-timeout-blocks))
+)
+
+(define-read-only (get-shipment-milestones (shipment-id uint))
+  (map-get? shipment-milestones shipment-id)
 )
 
 (define-public (create-shipment 
@@ -330,5 +347,73 @@
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (ok (var-set dispute-timeout-blocks new-timeout))
+  )
+)
+
+(define-public (set-payment-milestones 
+  (shipment-id uint)
+  (pickup-percentage uint)
+  (delivery-percentage uint)
+)
+  (let
+    (
+      (shipment (unwrap! (map-get? shipments shipment-id) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get shipper shipment)) err-unauthorized)
+    (asserts! (is-eq (get status shipment) status-created) err-invalid-status)
+    (asserts! (is-eq (+ pickup-percentage delivery-percentage) u100) err-invalid-amount)
+    (map-set shipment-milestones shipment-id {
+      pickup-percentage: pickup-percentage,
+      delivery-percentage: delivery-percentage,
+      pickup-released: false,
+      delivery-released: false
+    })
+    (ok true)
+  )
+)
+
+(define-public (release-pickup-milestone (shipment-id uint))
+  (let
+    (
+      (shipment (unwrap! (map-get? shipments shipment-id) err-not-found))
+      (milestones (unwrap! (map-get? shipment-milestones shipment-id) err-invalid-milestone))
+      (carrier (unwrap! (get carrier shipment) err-carrier-not-assigned))
+      (payment (get payment-amount shipment))
+      (pickup-amount (/ (* payment (get pickup-percentage milestones)) u100))
+    )
+    (asserts! (is-eq (get status shipment) status-in-transit) err-milestone-not-reached)
+    (asserts! (not (get pickup-released milestones)) err-milestone-already-released)
+    (asserts! (is-eq tx-sender (get shipper shipment)) err-unauthorized)
+    (try! (as-contract (stx-transfer? pickup-amount tx-sender carrier)))
+    (map-set shipment-milestones shipment-id (merge milestones {
+      pickup-released: true
+    }))
+    (ok true)
+  )
+)
+
+(define-public (release-delivery-milestone (shipment-id uint))
+  (let
+    (
+      (shipment (unwrap! (map-get? shipments shipment-id) err-not-found))
+      (milestones (unwrap! (map-get? shipment-milestones shipment-id) err-invalid-milestone))
+      (carrier (unwrap! (get carrier shipment) err-carrier-not-assigned))
+      (payment (get payment-amount shipment))
+      (fee (get platform-fee shipment))
+      (delivery-amount (/ (* payment (get delivery-percentage milestones)) u100))
+    )
+    (asserts! (is-eq (get status shipment) status-delivered) err-milestone-not-reached)
+    (asserts! (not (get delivery-released milestones)) err-milestone-already-released)
+    (asserts! (is-eq tx-sender (get shipper shipment)) err-unauthorized)
+    (try! (as-contract (stx-transfer? delivery-amount tx-sender carrier)))
+    (try! (as-contract (stx-transfer? fee tx-sender contract-owner)))
+    (map-set shipment-milestones shipment-id (merge milestones {
+      delivery-released: true
+    }))
+    (map-set shipments shipment-id (merge shipment {
+      status: status-completed
+    }))
+    (update-carrier-rating carrier true)
+    (ok true)
   )
 )
